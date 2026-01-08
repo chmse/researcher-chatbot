@@ -15,7 +15,7 @@ GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
 def get_model():
-    """البحث عن اسم النموذج الصحيح المتاح لتجنب خطأ 404"""
+    """البحث عن اسم النموذج الصحيح المتاح في الحساب"""
     try:
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in models:
@@ -26,7 +26,7 @@ def get_model():
 
 MODEL_NAME = get_model()
 
-# --- 2. تحميل المكتبة الكاملة من المجلد ---
+# --- 2. تحميل المكتبة الكاملة ---
 all_knowledge = []
 KB_PATH = "library_knowledge"
 
@@ -42,47 +42,39 @@ def load_library():
 
 load_library()
 
-# --- 3. محرك البحث الموسع (لجلب القوائم والتعليل) ---
-def normalize(text):
-    if not text: return ""
-    return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", text))).strip()
+# --- 3. خوارزمية البحث الذكي (الجذور + المترادفات + الجوار) ---
+STOP_WORDS = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي"}
+SYNONYMS = {"توثيق": ["حجج", "إسناد", "رواية"], "أصل": ["قاعدة", "أساس", "منطلق"]}
 
-def advanced_search(query, units, top_k=3):
-    """خوارزمية البحث الموسعة التي تتبع الترقيم وتجلب الجوار"""
-    query_norm = normalize(query)
-    stop_words = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي"}
-    keywords = [w for w in query_norm.split() if w not in stop_words and len(w) > 2]
+def normalize(t): return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", t))).strip()
+def stem(w): 
+    for s in ["ات","ون","ين","هم","نا"]: 
+        if w.endswith(s) and len(w) > 4: return w[:-len(s)]
+    return w
+
+def library_smart_search(query, top_k=2):
+    q_norm = normalize(query)
+    words = [stem(w) for w in q_norm.split() if w not in STOP_WORDS and len(w) > 2]
+    expanded_keywords = set(words)
+    for w in words:
+        if w in SYNONYMS: expanded_keywords.update(SYNONYMS[w])
     
     scored_indices = []
-    for idx, unit in enumerate(units):
-        content_norm = normalize(unit.get("content", ""))
-        score = sum(2 for kw in keywords if kw in content_norm)
-        
-        # ميزة إضافية: إذا كان المقطع يبدأ بترقيم مثل (1- أو 1) )
-        if re.match(r'^(\d+[-)]|[أ-ي][-)])', unit.get("content", "").strip()):
-            score += 1
-            
+    for idx, u in enumerate(all_knowledge):
+        content_norm = normalize(u.get("content", ""))
+        score = sum(1 for kw in expanded_keywords if kw in content_norm)
         if score > 0:
-            # تحيز بسيط للصفحات الأولى
-            score += (1 - (unit.get("page_pdf", 0) / 500))
+            score += (1 - (u.get("page_pdf", 0) / 500))
             scored_indices.append((score, idx))
     
     scored_indices.sort(key=lambda x: x[0], reverse=True)
     
     final_indices = set()
-    # مسح تتبعي (Look-ahead) لـ 12 وحدة تالية لضمان جلب كل النقاط المرقمة (الاستفاضة)
     for _, idx in scored_indices[:top_k]:
-        for i in range(max(0, idx-1), min(len(units), idx+12)):
-            unit_content = units[i].get("content", "")
-            # ضم المقطع إذا كان هو المختار أو يمثل تكملة لترقيم (قائمة)
-            if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', unit_content.strip()):
-                final_indices.add(i)
-            # التوقف إذا ابتعدنا عن السياق ولم نجد ترقيماً أو كلمات بحث
-            if i > idx + 4 and not re.match(r'^(\d+[-)]|[أ-ي][-)])', unit_content.strip()):
-                if not any(kw in normalize(unit_content) for kw in keywords):
-                    break
-
-    return [units[i] for i in sorted(list(final_indices))]
+        # جلب المقطع مع جواره لضمان التعليل
+        final_indices.update({max(0, idx-1), idx, min(len(all_knowledge)-1, idx+1)})
+    
+    return [all_knowledge[i] for i in sorted(list(final_indices))]
 
 # --- 4. نقطة الاتصال (API Endpoint) ---
 @app.route('/ask', methods=['POST'])
@@ -92,49 +84,42 @@ def ask():
         user_query = data.get("question")
         if not user_query: return jsonify({"error": "No question"}), 400
 
-        # أ. البحث الموسع في كل المكتبة
-        results = advanced_search(user_query, all_knowledge)
+        results = library_smart_search(user_query)
         if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة."})
 
-        # ب. بناء نص السياق الموثق
+        # بناء نص السياق الموثق
         ctx_text = ""
         for i, u in enumerate(results):
             page = u.get('page_pdf', '--')
             book = u.get('book', 'كتاب غير محدد')
             author = u.get('author', 'غير معروف')
             part = u.get('part', '--')
-            ctx_text += f"\n[مرجع: {i+1}] [ص: {page}] [كتاب: {book}] [مؤلف: {author}] [ج: {part}]\n{u['content']}\n"
+            content = u.get('content', '')
+            ctx_text += f"\n[مرجع: {i+1}] [ص: {page}] [كتاب: {book}] [مؤلف: {author}] [ج: {part}]\n{content}\n"
         
-        # ج. الموجه الصارم (الدستور الأكاديمي)
-        system_instruction = """
-        أنت باحث أكاديمي متخصص في فكر الدكتور عبد الرحمن الحاج صالح.
-        مهمتك: استخراج جميع النقاط والمفاهيم المتعلقة بسؤال المستخدم من النصوص المرفقة حصراً.
-        
-        القواعد الصارمة:
-        1. الشمولية: استخرج كل المفاهيم والفقرات المرقمة (1، 2، 3، 4...) ولا تكتفِ بالأولى فقط.
-        2. النقل الحرفي: انقل الجمل كما هي داخل علامتي تنصيص ' '.
-        3. المتن: ضع الاقتباس الحرفي بين ' ' متبوعاً برقم المرجع المذكور في السياق؛ مثال: 'هذا نص من الكتاب' [1].
-        4. الحاشية: في نهاية الإجابة، اكتب عنواناً (المراجع:) ثم البيانات لكل رقم: رقم- اسم المؤلف، اسم الكتاب، الجزء، ص: الصفحة.
-        5. الروابط: استخدم روابط لغوية بسيطة للجمع بين النقاط الموزعة.
-        6. ممنوع الإجابة من خارج المرفقات نهائياً.
-        """
+        prompt = f"""أنت محقق أكاديمي ملتزم بالنقل الحرفي الصارم من النصوص المرفقة فقط.
+        السياق المرجعي: {ctx_text}
+        سؤال الباحث: {user_query}
+        التعليمات:
+        1. المتن: انقل النص حرفياً بين علامتي تنصيص ' ' متبوعاً برقم المرجع [1].
+        2. الحاشية: في النهاية، اذكر المراجع بالصيغة: رقم- المؤلف، الكتاب، الجزء، ص: الصفحة.
+        3. الصرامة: لا تضف أي شرح خارجي من عندك نهائياً."""
 
         model = genai.GenerativeModel(model_name=MODEL_NAME)
         
-        # د. محاولة التوليد مع معالجة الازدحام
-        for attempt in range(4):
+        # معالجة ضغط الطلبات (Retry Loop)
+        for attempt in range(3):
             try:
-                full_prompt = f"{system_instruction}\n\nنصوص المرجع:\n{ctx_text}\n\nسؤال الباحث: {user_query}"
-                response = model.generate_content(full_prompt, generation_config={"temperature": 0.0})
+                response = model.generate_content(prompt, generation_config={"temperature": 0.0})
                 return jsonify({"answer": response.text})
             except exceptions.TooManyRequests:
-                wait_time = 15 + (attempt * 5)
-                time.sleep(wait_time)
+                time.sleep(10)
         
-        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى الانتظار دقيقة واحدة ثم المحاولة."})
+        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى إعادة المحاولة بعد ثوانٍ."})
 
     except Exception as e:
         return jsonify({"answer": f"❌ خطأ تقني: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
