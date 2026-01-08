@@ -26,7 +26,7 @@ def get_model():
 
 MODEL_NAME = get_model()
 
-# --- 2. تحميل المكتبة الكاملة ---
+# --- 2. تحميل المكتبة الكاملة من المجلد ---
 all_knowledge = []
 KB_PATH = "library_knowledge"
 
@@ -42,13 +42,13 @@ def load_library():
 
 load_library()
 
-# --- 3. محرك البحث الذكي المطور (تتبع القوائم والتعليل) ---
+# --- 3. محرك البحث الموسع (لجلب القوائم والتعليل) ---
 def normalize(text):
     if not text: return ""
     return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", text))).strip()
 
-def advanced_library_search(query, units, top_k=3):
-    """خوارزمية البحث الموسعة لجلب القوائم والتعليل"""
+def advanced_search(query, units, top_k=3):
+    """خوارزمية البحث الموسعة التي تتبع الترقيم وتجلب الجوار"""
     query_norm = normalize(query)
     stop_words = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي"}
     keywords = [w for w in query_norm.split() if w not in stop_words and len(w) > 2]
@@ -70,7 +70,7 @@ def advanced_library_search(query, units, top_k=3):
     scored_indices.sort(key=lambda x: x[0], reverse=True)
     
     final_indices = set()
-    # جلب أفضل النتائج مع مسح تتبعي (Look-ahead) لـ 12 وحدة تالية لضمان شمولية القوائم
+    # مسح تتبعي (Look-ahead) لـ 12 وحدة تالية لضمان جلب كل النقاط المرقمة (الاستفاضة)
     for _, idx in scored_indices[:top_k]:
         for i in range(max(0, idx-1), min(len(units), idx+12)):
             unit_content = units[i].get("content", "")
@@ -92,8 +92,8 @@ def ask():
         user_query = data.get("question")
         if not user_query: return jsonify({"error": "No question"}), 400
 
-        # أ. البحث الموسع
-        results = advanced_library_search(user_query, all_knowledge)
+        # أ. البحث الموسع في كل المكتبة
+        results = advanced_search(user_query, all_knowledge)
         if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة."})
 
         # ب. بناء نص السياق الموثق
@@ -103,39 +103,38 @@ def ask():
             book = u.get('book', 'كتاب غير محدد')
             author = u.get('author', 'غير معروف')
             part = u.get('part', '--')
-            ctx_text += f"\n[المرجع: {i+1}] [ص: {page}] [الكتاب: {book}] [المؤلف: {author}] [ج: {part}]\n{u['content']}\n"
+            ctx_text += f"\n[مرجع: {i+1}] [ص: {page}] [كتاب: {book}] [مؤلف: {author}] [ج: {part}]\n{u['content']}\n"
         
-        # ج. الموجه الصارم (كما طلبت دون اختصار)
+        # ج. الموجه الصارم (الدستور الأكاديمي)
         system_instruction = """
-        أنت باحث أكاديمي متخصص في فكر الدكتور الحاج صالح.
-        مهمتك: استخراج جميع النقاط والمفاهيم المتعلقة بسؤال المستخدم من النصوص المرفقة.
+        أنت باحث أكاديمي متخصص في فكر الدكتور عبد الرحمن الحاج صالح.
+        مهمتك: استخراج جميع النقاط والمفاهيم المتعلقة بسؤال المستخدم من النصوص المرفقة حصراً.
         
         القواعد الصارمة:
-        1. الشمولية: استخرج كل المفاهيم (1، 2، 3، 4، 5...) المذكورة في النص ولا تكتفِ بالأولى فقط.
+        1. الشمولية: استخرج كل المفاهيم والفقرات المرقمة (1، 2، 3، 4...) ولا تكتفِ بالأولى فقط.
         2. النقل الحرفي: انقل الجمل كما هي داخل علامتي تنصيص ' '.
-        3. المتن: انقل النص حرفياً بين علامتي تنصيص ' ' متبوعاً برقم المرجع [1].
-        الحاشية: في النهاية، اذكر المراجع بالصيغة: رقم- المؤلف، الكتاب، الجزء، ص: الصفحة
-        4. الروابط: استخدم روابط لغوية بسيطة للجمع بين النقاط الموزعة على صفحات مختلفة.
-        5. ممنوع تماماً الإجابة من خارج المرفقات.
+        3. المتن: ضع الاقتباس الحرفي بين ' ' متبوعاً برقم المرجع المذكور في السياق؛ مثال: 'هذا نص من الكتاب' [1].
+        4. الحاشية: في نهاية الإجابة، اكتب عنواناً (المراجع:) ثم البيانات لكل رقم: رقم- اسم المؤلف، اسم الكتاب، الجزء، ص: الصفحة.
+        5. الروابط: استخدم روابط لغوية بسيطة للجمع بين النقاط الموزعة.
+        6. ممنوع الإجابة من خارج المرفقات نهائياً.
         """
 
         model = genai.GenerativeModel(model_name=MODEL_NAME)
         
-        # د. محاولة التوليد مع معالجة ضغط الطلبات
-        for attempt in range(3):
+        # د. محاولة التوليد مع معالجة الازدحام
+        for attempt in range(4):
             try:
-                prompt = f"{system_instruction}\n\nنصوص المرجع:\n{ctx_text}\n\nسؤال المستخدم: {user_query}"
-                response = model.generate_content(prompt, generation_config={"temperature": 0.0})
+                full_prompt = f"{system_instruction}\n\nنصوص المرجع:\n{ctx_text}\n\nسؤال الباحث: {user_query}"
+                response = model.generate_content(full_prompt, generation_config={"temperature": 0.0})
                 return jsonify({"answer": response.text})
             except exceptions.TooManyRequests:
-                time.sleep(15)
+                wait_time = 15 + (attempt * 5)
+                time.sleep(wait_time)
         
-        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى الانتظار قليلاً ثم المحاولة."})
+        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى الانتظار دقيقة واحدة ثم المحاولة."})
 
     except Exception as e:
         return jsonify({"answer": f"❌ خطأ تقني: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
-
-
