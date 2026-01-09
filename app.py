@@ -7,12 +7,18 @@ from flask_cors import CORS
 import google.generativeai as genai
 from google.api_core import exceptions
 
+### ### 1. إضافة مكتبة ChromaDB ###
+import chromadb
+
 app = Flask(__name__)
-CORS(app) 
+CORS(app)
 
 # --- 1. إعدادات جوجل Gemini واكتشاف النموذج ---
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
+
+# تعريف نموذج التضمين (Embedding Model) كمتغير عام
+EMBEDDING_MODEL = 'models/embedding-001'
 
 def get_model_name():
     try:
@@ -25,60 +31,116 @@ def get_model_name():
 
 MODEL_NAME = get_model_name()
 
-# --- 2. تحميل المكتبة ---
+# --- 2. تحميل المكتبة وتهيئة ChromaDB ---
 all_knowledge = []
 KB_PATH = "library_knowledge"
+chroma_collection = None # سيتم تعيينه عند بدء التشغيل
 
-def load_library():
-    global all_knowledge
+def initialize_knowledge_base():
+    """
+    هذه الدالة تقوم بتحميل ملفات JSON وملء قاعدة بيانات ChromaDB.
+    ستستغرق هذه العملية وقتاً طويلاً في كل مرة يتم فيها إعادة تشغيل التطبيق.
+    """
+    global all_knowledge, chroma_collection
+    
+    print("🚀 بدء تحميل المكتبة وتهيئة قاعدة البيانات الدلالية... قد يستغرق هذا بعض الوقت.")
+    start_time = time.time()
+
+    # 1. تحميل ملفات JSON كما في السابق
     all_knowledge = []
     if os.path.exists(KB_PATH):
         for filename in sorted(os.listdir(KB_PATH)):
             if filename.endswith(".json"):
                 with open(os.path.join(KB_PATH, filename), "r", encoding="utf-8") as f:
                     all_knowledge.extend(json.load(f))
-    return len(all_knowledge)
-
-load_library()
-
-# --- 3. محرك البحث الاستكشافي العميق ---
-def normalize(text):
-    if not text: return ""
-    text = re.sub("[إأآا]", "ا", text)
-    text = re.sub("[ةه]", "ه", text)
-    text = re.sub("ى", "ي", text)
-    return re.sub(r'[\u064B-\u0652]', '', text).strip()
-
-def advanced_search(query, units, top_k=6): # تم رفع top_k لجلب مساحة أكبر
-    query_norm = normalize(query)
-    stop_words = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي"}
-    keywords = [w for w in query_norm.split() if w not in stop_words and len(w) > 2]
     
-    scored_indices = []
-    for idx, unit in enumerate(units):
-        content_norm = normalize(unit.get("content", ""))
-        score = sum(5 for kw in keywords if kw in content_norm)
-        if re.match(r'^(\d+[-)]|[أ-ي][-)])', unit.get("content", "").strip()): score += 2
-        if score > 0:
-            score += (1 - (unit.get("page_pdf", 0) / 1000))
-            scored_indices.append((score, idx))
-    
-    scored_indices.sort(key=lambda x: x[0], reverse=True)
-    
-    final_indices = set()
-    for _, idx in scored_indices[:top_k]:
-        # جلب المقطع مع مسح تتابعي واسع (20 وحدة تالية) لضمان عدم ضياع القوائم الطويلة
-        for i in range(max(0, idx-1), min(len(units), idx+20)):
-            u_content = units[i].get("content", "")
-            if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()) or any(k in normalize(u_content) for k in keywords):
-                final_indices.add(i)
-            # توقف ذكي عند الخروج تماماً عن الموضوع
-            if i > idx + 8 and not re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()):
-                break
-                
-    return [units[i] for i in sorted(list(final_indices))]
+    if not all_knowledge:
+        print("⚠️ لم يتم العثور على ملفات معرفة. لن تتم تهيئة قاعدة البيانات.")
+        return
 
-# --- 4. نقطة الاتصال (الصياغة الموسعة والموثقة) ---
+    # 2. تهيئة عميل ChromaDB في الذاكرة (لا يستخدم قرصاً)
+    chroma_client = chromadb.Client()
+    # حذف المجموعة القديمة إذا وجدت لضمان بيانات جديدة
+    try:
+        chroma_client.delete_collection("knowledge_base")
+    except:
+        pass
+    
+    chroma_collection = chroma_client.create_collection("knowledge_base")
+
+    # 3. تحويل كل وحدة معرفية إلى متجه وإضافتها إلى قاعدة البيانات
+    documents = []
+    metadatas = []
+    ids = []
+
+    for unit in all_knowledge:
+        documents.append(unit.get("content", ""))
+        metadatas.append({
+            "author": unit.get("author", "--"),
+            "book": unit.get("book", "--"),
+            "part": unit.get("part", "--"),
+            "page_pdf": str(unit.get("page_pdf", "--"))
+        })
+        ids.append(unit.get("unit_id", f"id_{len(ids)}"))
+
+    # تقسيم المهام إلى دفعات لتجنب أخطاء الذاكرة أو حدود الطلبات
+    batch_size = 100
+    for i in range(0, len(documents), batch_size):
+        batch_docs = documents[i:i+batch_size]
+        # الحصول على المتجهات (Embeddings) من جوجل
+        response = genai.embed_content(model=EMBEDDING_MODEL, content=batch_docs)
+        embeddings = response["embedding"]
+        
+        batch_ids = ids[i:i+batch_size]
+        batch_metadatas = metadatas[i:i+batch_size]
+
+        chroma_collection.add(
+            ids=batch_ids,
+            embeddings=embeddings,
+            documents=batch_docs,
+            metadatas=batch_metadatas
+        )
+        print(f"✅ تمت معالجة {min(i + batch_size, len(documents))} من أصل {len(documents)} وحدة.")
+
+    end_time = time.time()
+    print(f"🎉 اكتملت تهيئة قاعدة البيانات الدلالية في {end_time - start_time:.2f} ثانية.")
+
+# استدعاء دالة التهيئة عند بدء تشغيل التطبيق
+initialize_knowledge_base()
+
+# --- 3. محرك البحث الدلالي الجديد ---
+def semantic_search(query, collection, n_results=6):
+    """
+    يستخدم قاعدة بيانات ChromaDB للبحث عن أقرب النصوص معنىً للاستعلام.
+    """
+    if not collection:
+        return []
+        
+    # الحصول على المتجه الخاص بالاستعلام
+    response = genai.embed_content(model=EMBEDDING_MODEL, content=query)
+    query_embedding = response["embedding"]
+
+    # البحث في قاعدة البيانات
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=n_results
+    )
+
+    # إعادة تشكيل النتائج لتتوافق مع شكل الكود الأصلي
+    final_results = []
+    for i in range(len(results['ids'][0])):
+        final_results.append({
+            "unit_id": results['ids'][0][i],
+            "content": results['documents'][0][i],
+            "author": results['metadatas'][0][i]['author'],
+            "book": results['metadatas'][0][i]['book'],
+            "part": results['metadatas'][0][i]['part'],
+            "page_pdf": int(results['metadatas'][0][i]['page_pdf'])
+        })
+        
+    return final_results
+
+# --- 4. نقطة الاتصال (مع استخدام البحث الدلالي) ---
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
@@ -86,7 +148,9 @@ def ask():
         user_query = data.get("question")
         if not user_query: return jsonify({"answer": "لم يصل سؤال."}), 400
 
-        results = advanced_search(user_query, all_knowledge)
+        ### ### استدعاء محرك البحث الجديد ###
+        results = semantic_search(user_query, chroma_collection, n_results=6)
+        
         if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة."})
 
         ctx_text = ""
