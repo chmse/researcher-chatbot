@@ -1,7 +1,8 @@
-   flask
-   flask-cors
-   google-generativeai
-   chromadb
-   gunicorn
+flask
+flask-cors
+google-generativeai
+numpy
+scikit-learn
+gunicorn
 
 
