@@ -13,7 +13,7 @@ from sklearn.neighbors import NearestNeighbors
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini ---
+# --- 1. إعدادات جوجل Gemini واكتشاف النموذج ---
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 EMBEDDING_MODEL = 'models/embedding-001'
@@ -70,16 +70,10 @@ def initialize_semantic_index():
         vector_index.fit(all_embeddings)
         
         db_status = 'ready'
-        print("✅ Semantic index is ready.")
-    except Exception as e:
-        print(f"❌ Error during initialization: {e}")
+    except:
         db_status = 'failed'
 
 # --- 3. محرك البحث الذكي (دلالي + تتبع القوائم) ---
-def normalize(text):
-    if not text: return ""
-    return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", text))).strip()
-
 def advanced_semantic_search(query, top_k=3):
     if db_status != 'ready': return []
     
@@ -89,7 +83,6 @@ def advanced_semantic_search(query, top_k=3):
     
     final_indices = set()
     for idx in indices[0]:
-        # جلب المقطع مع مسح تتابعي لـ 15 وحدة (نفس خوارزميتك)
         for i in range(max(0, idx-1), min(len(all_knowledge), idx+15)):
             u_content = all_knowledge[i].get("content", "")
             if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()):
@@ -104,6 +97,7 @@ def advanced_semantic_search(query, top_k=3):
 def ask():
     try:
         initialize_semantic_index()
+        if db_status == 'failed': return jsonify({"answer": "❌ خطأ في قاعدة البيانات."}), 500
         if db_status != 'ready':
             return jsonify({"answer": "⏳ جاري تهيئة المكتبة دلالياً، يرجى المحاولة بعد قليل."}), 503
 
@@ -116,7 +110,11 @@ def ask():
 
         ctx_text = ""
         for i, u in enumerate(results):
-            ctx_text += f"\n[مرجع: {i+1}] [ص: {u.get('page_pdf','--')}] [كتاب: {u.get('book','--')}] [مؤلف: {u.get('author','--')}] [ج: {u.get('part','--')}]\n{u['content']}\n"
+            page = u.get('page_pdf', '--')
+            book = u.get('book', 'كتاب غير محدد')
+            author = u.get('author', 'غير معروف')
+            part = u.get('part', '--')
+            ctx_text += f"\n[مرجع: {i+1}] [ص: {page}] [كتاب: {book}] [مؤلف: {author}] [ج: {part}]\n{u['content']}\n"
         
         prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:
         مهمتك صياغة إجابة 'مدمجة' و 'مرتبة' وفق الشروط الصارمة التالية:
@@ -125,7 +123,7 @@ def ask():
         3. الترقيم المتسلسل: يجب أن يكون ترقيم المراجع في المتن متسلسلاً تصاعدياً (1، 2، 3...).
         4. هيكل الفقرات: ابدأ كل نقطة أو عنصر أساسي في سطر جديد.
         5. الحاشية: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: رقم الصفحة.
-        6. الصرامة العلمية: ممنوع منعاً باتاً إضافة أي شرح أو تأويل من عندك.
+        6. الصرامة العلمية: ممنوع منعاً باتاً إضافة أي شرح من عندك.
         نصوص المرجع:\n{ctx_text}\nسؤال الباحث: {user_query}"""
 
         model = genai.GenerativeModel(model_name=MODEL_NAME)
@@ -141,4 +139,4 @@ def ask():
         return jsonify({"answer": f"❌ خطأ تقني: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
