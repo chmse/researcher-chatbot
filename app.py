@@ -1,3 +1,4 @@
+
 import os
 import json
 import re
@@ -13,9 +14,11 @@ from sklearn.neighbors import NearestNeighbors
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini واكتشاف النموذج ---
+# --- 1. إعدادات جوجل Gemini ---
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+
 EMBEDDING_MODEL = 'models/embedding-001'
 
 def get_model_name():
@@ -29,7 +32,7 @@ def get_model_name():
 
 MODEL_NAME = get_model_name()
 
-# --- 2. تهيئة الفهرس الدلالي الخفيف (Scikit-Learn) ---
+# --- 2. تهيئة الفهرس الدلالي (Scikit-Learn) ---
 all_knowledge = []
 KB_PATH = "library_knowledge"
 vector_index = None
@@ -52,6 +55,7 @@ def initialize_semantic_index():
                         all_knowledge.extend(json.load(f))
         
         if not all_knowledge:
+            print("❌ No JSON files found in library_knowledge")
             db_status = 'failed'
             return
 
@@ -70,10 +74,16 @@ def initialize_semantic_index():
         vector_index.fit(all_embeddings)
         
         db_status = 'ready'
-    except:
+        print("✅ Semantic index is ready.")
+    except Exception as e:
+        print(f"❌ Error during initialization: {e}")
         db_status = 'failed'
 
 # --- 3. محرك البحث الذكي (دلالي + تتبع القوائم) ---
+def normalize(text):
+    if not text: return ""
+    return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", text))).strip()
+
 def advanced_semantic_search(query, top_k=3):
     if db_status != 'ready': return []
     
@@ -92,29 +102,42 @@ def advanced_semantic_search(query, top_k=3):
                 
     return [all_knowledge[i] for i in sorted(list(final_indices))]
 
-# --- 4. نقطة الاتصال (الموجه الأكاديمي الصارم) ---
+# --- 4. المسارات (Routes) ---
+
+@app.route('/')
+def home():
+    return "✅ المساعد الأكاديمي يعمل بنجاح متصل بالمكتبة الرقمية."
+
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
+        if not GOOGLE_API_KEY:
+            return jsonify({"answer": "❌ خطأ: مفتاح API غير موجود في إعدادات الخادم (Environment Variables)."}), 500
+
         initialize_semantic_index()
-        if db_status == 'failed': return jsonify({"answer": "❌ خطأ في قاعدة البيانات."}), 500
+        
+        if db_status == 'failed':
+            return jsonify({"answer": "❌ خطأ: لم يجد الخادم ملفات الكتب في مجلد library_knowledge."}), 500
+            
         if db_status != 'ready':
-            return jsonify({"answer": "⏳ جاري تهيئة المكتبة دلالياً، يرجى المحاولة بعد قليل."}), 503
+            return jsonify({"answer": "⏳ جاري تحضير المكتبة رقمياً لأول مرة، يرجى إعادة المحاولة بعد 30 ثانية."}), 503
 
         data = request.json
         user_query = data.get("question")
         if not user_query: return jsonify({"answer": "لم يصل سؤال."}), 400
 
         results = advanced_semantic_search(user_query)
-        if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة."})
+        if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في الكتب المتاحة."})
 
         ctx_text = ""
         for i, u in enumerate(results):
+            # استخدام .get() للأمان ومنع KeyError
             page = u.get('page_pdf', '--')
             book = u.get('book', 'كتاب غير محدد')
             author = u.get('author', 'غير معروف')
             part = u.get('part', '--')
-            ctx_text += f"\n[مرجع: {i+1}] [ص: {page}] [كتاب: {book}] [مؤلف: {author}] [ج: {part}]\n{u['content']}\n"
+            content = u.get('content', '')
+            ctx_text += f"\n[مرجع: {i+1}] [ص: {page}] [كتاب: {book}] [مؤلف: {author}] [ج: {part}]\n{content}\n"
         
         prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:
         مهمتك صياغة إجابة 'مدمجة' و 'مرتبة' وفق الشروط الصارمة التالية:
@@ -122,8 +145,9 @@ def ask():
         2. النقل الحرفي: انقل الجمل حرفياً كما وردت في المرجع، وضع كل نص منقول بين علامتي تنصيص مزدوجة "" متبوعاً برقم مرجع متسلسل [1]، ثم [2]، وهكذا.
         3. الترقيم المتسلسل: يجب أن يكون ترقيم المراجع في المتن متسلسلاً تصاعدياً (1، 2، 3...).
         4. هيكل الفقرات: ابدأ كل نقطة أو عنصر أساسي في سطر جديد.
-        5. الحاشية: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: رقم الصفحة.
-        6. الصرامة العلمية: ممنوع منعاً باتاً إضافة أي شرح من عندك.
+        5. الحاشية: في النهاية اذكر المراجع: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: الصفحة.
+        6. الصرامة العلمية: ممنوع منعاً باتاً إضافة أي شرح أو تأويل من عندك. التوسع يكون فقط من خلال النصوص المرفقة.
+        
         نصوص المرجع:\n{ctx_text}\nسؤال الباحث: {user_query}"""
 
         model = genai.GenerativeModel(model_name=MODEL_NAME)
@@ -131,12 +155,13 @@ def ask():
             try:
                 response = model.generate_content(prompt, generation_config={"temperature": 0.0})
                 return jsonify({"answer": response.text})
-            except exceptions.TooManyRequests: time.sleep(15)
+            except exceptions.TooManyRequests: 
+                time.sleep(15)
         
-        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً."})
+        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى المحاولة بعد قليل."})
 
     except Exception as e:
-        return jsonify({"answer": f"❌ خطأ تقني: {str(e)}"}), 500
+        return jsonify({"answer": f"❌ خطأ تقني داخلي: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
