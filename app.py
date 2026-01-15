@@ -10,7 +10,7 @@ from google.api_core import exceptions
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini ---
+# --- 1. إعدادات جوجل Gemini واكتشاف النموذج ---
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -25,7 +25,7 @@ def get_model_name():
 
 MODEL_NAME = get_model_name()
 
-# --- 2. تحميل المكتبة الكاملة ---
+# --- 2. تحميل المكتبة الكاملة من المجلد ---
 all_knowledge = []
 KB_PATH = "library_knowledge"
 
@@ -33,6 +33,7 @@ def load_library():
     global all_knowledge
     all_knowledge = []
     if os.path.exists(KB_PATH):
+        # ترتيب الملفات لضمان تسلسل الأفكار
         for filename in sorted(os.listdir(KB_PATH)):
             if filename.endswith(".json"):
                 with open(os.path.join(KB_PATH, filename), "r", encoding="utf-8") as f:
@@ -41,58 +42,45 @@ def load_library():
 
 load_library()
 
-# --- 3. خوارزمية البحث الذكي الاستكشافي (أفضل أداء مجاني) ---
-STOP_WORDS = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي","بحث"}
-SYNONYMS = {"توثيق": ["حجج", "إسناد", "رواية"], "أصل": ["أساس", "قاعدة", "منطلق"]}
-
+# --- 3. محرك البحث الاستكشافي (لجلب القوائم والتعليل) ---
 def normalize(text):
     if not text: return ""
-    text = re.sub("[إأآا]", "ا", text)
-    text = re.sub("[ةه]", "ه", text)
-    text = re.sub("ى", "ي", text)
-    return re.sub(r'[\u064B-\u0652]', '', text).strip()
+    return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", text))).strip()
 
-def stem(w): 
-    for s in ["ات","ون","ين","هم","نا"]: 
-        if w.endswith(s) and len(w) > 4: return w[:-len(s)]
-    return w
-
-def library_search(query, units, top_k=3):
+def advanced_search(query, units, top_k=3):
+    """خوارزمية تبحث عن طرف الخيط ثم تسحب كل العناصر المرتبطة تلو بعضها"""
     query_norm = normalize(query)
-    words = [stem(w) for w in query_norm.split() if w not in STOP_WORDS and len(w) > 2]
-    keywords = set(words)
-    for k in list(keywords):
-        if k in SYNONYMS: keywords.update(SYNONYMS[k])
+    stop_words = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي"}
+    keywords = [w for w in query_norm.split() if w not in stop_words and len(w) > 2]
     
     scored_indices = []
     for idx, unit in enumerate(units):
         content = unit.get("content", "")
-        content_norm = normalize(content)
-        score = sum(5 for kw in keywords if kw in content_norm)
+        score = sum(5 for kw in keywords if kw in normalize(content))
+        # إعطاء أفضلية للمقاطع التي تبدأ بترقيم
         if re.match(r'^(\d+[-)]|[أ-ي][-)])', content.strip()): score += 2
+        
         if score > 0:
-            score += (1 - (unit.get("page_pdf", 0) / 1000))
             scored_indices.append((score, idx))
     
     scored_indices.sort(key=lambda x: x[0], reverse=True)
     
     final_indices = set()
+    # جلب المقطع المختار + مسح تتبعي عميق (15 وحدة) لضمان جلب القوائم كاملة
     for _, idx in scored_indices[:top_k]:
-        # مسح تتابعي لـ 20 وحدة لضمان جلب كل النقاط المرقمة
-        for i in range(max(0, idx-1), min(len(units), idx+20)):
+        # نأخذ مقطعين قبل (للتمهيد) و15 مقطع بعد (لسحب القائمة كاملة)
+        for i in range(max(0, idx-2), min(len(units), idx+15)):
             u_content = units[i].get("content", "")
+            # ضم المقطع إذا كان مرتبطاً بالترقيم أو يحتوي على كلمات بحث
             if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()) or any(k in normalize(u_content) for k in keywords):
                 final_indices.add(i)
+            # توقف إذا ابتعدنا عن السياق ولم نعد نجد ترقيماً
             if i > idx + 5 and not re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()):
                 break
+                
     return [units[i] for i in sorted(list(final_indices))]
 
-# --- 4. المسارات ونقطة الاتصال ---
-
-@app.route('/')
-def home():
-    return jsonify({"status": "ready", "total_units": len(all_knowledge)})
-
+# --- 4. نقطة الاتصال (المصفي والموثق الأكاديمي) ---
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
@@ -100,29 +88,42 @@ def ask():
         user_query = data.get("question")
         if not user_query: return jsonify({"answer": "لم يصل سؤال."}), 400
 
-        results = library_search(user_query, all_knowledge)
+        results = advanced_search(user_query, all_knowledge)
         if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة."})
 
         ctx_text = ""
         for i, u in enumerate(results):
             ctx_text += f"\n[مرجع رقم: {i+1}] [ص: {u.get('page_pdf','--')}] [كتاب: {u.get('book','--')}] [مؤلف: {u.get('author','--')}] [ج: {u.get('part','--')}]\n{u['content']}\n"
         
-        prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:
-        1. العبارة الاستهلالية: ابدأ الإجابة حصراً بـ: "بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:"
-        2. النقل الحرفي: انقل الجمل حرفياً بين علامتي تنصيص "" متبوعاً برقم مرجع متسلسل [1].
-        3. الحاشية: في النهاية اذكر المراجع: رقم المرجع- اسم المؤلف، الكتاب، الجزء، ص: رقم الصفحة.
-        4. الصرامة: لا تضف أي شرح خارجي. انقل كل النقاط المرقمة (1، 2، 3...) الواردة في النص.
-        
-        نصوص المرجع:\n{ctx_text}\nسؤال الباحث: {user_query}"""
+        # الموجه (Prompt) المطور حسب طلبك
+        prompt = f"""بصفتي مساعد ذكي في الحلقة اللسانية، قمت بالتنقيب في فكر البروفيسور عبد الرحمن الحاج صالح، وإليكم المفاهيم والفقرات الموثقة التي تم استخراجها استجابةً لسؤالكم:
+        مهمتك صياغة إجابة 'مدمجة' و 'مرتبة' وفق الشروط التالية:
+        1. الالتزام بالنص: انقل المعلومات من الوحدات المرفقة فقط. يمكنك تحسين الصياغة اللغوية والإملائية دون تغيير المعنى أو الألفاظ اللسانية للمؤلف.
+        2. هيكل الفقرات: ابدأ كل نقطة أو عنصر مرقم (1، 2، 3...) في سطر جديد تماماً.
+        3. التوثيق (المتن): ضع النص المقتبس بين علامتي تنصيص ' ' متبوعاً برقم المرجع المذكور في السياق [1].
+        4. التوثيق (الحاشية): في نهاية الإجابة، اكتب عنواناً بارزاً (المراجع:) ثم سرد المراجع بالصيغة: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: رقم الصفحة.
+        5. الصرامة: لا تضف أي معلومات خارجية. التوسع يكون فقط من خلال ما ورد في النصوص المرفقة.
+        6. الربط: استخدم روابط لغوية محكمة للجمع بين الأفكار لتظهر كإجابة متصلة ومنسجمة.
+
+        النصوص المرجعية المستخرجة من المكتبة:
+        {ctx_text}
+
+        سؤال المستخدم:
+        {user_query}
+        """
 
         model = genai.GenerativeModel(model_name=MODEL_NAME)
+        
+        # محاولة التوليد مع معالجة الازدحام
         for _ in range(3):
             try:
                 response = model.generate_content(prompt, generation_config={"temperature": 0.0})
                 return jsonify({"answer": response.text})
-            except exceptions.TooManyRequests: time.sleep(10)
+            except exceptions.TooManyRequests:
+                time.sleep(12)
         
-        return jsonify({"answer": "⚠️ الخادم مزدحم، حاول مجدداً."})
+        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى المحاولة مرة أخرى الآن."})
+
     except Exception as e:
         return jsonify({"answer": f"❌ خطأ تقني: {str(e)}"}), 500
 
