@@ -10,20 +10,31 @@ from google.api_core import exceptions
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini ---
+# --- 1. إعدادات جوجل Gemini مع إصلاح خطأ الـ 404 ---
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
 def get_model_name():
+    """دالة ذكية لاكتشاف اسم النموذج الصحيح وتجنب خطأ 404"""
     try:
-        # محاولة اختيار أفضل نموذج متاح
-        return "models/gemini-1.5-flash"
-    except:
-        return "models/gemini-1.5-flash"
+        # محاولة سرد النماذج المتاحة لمفتاحك
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # البحث عن نموذج flash 1.5
+        for m in available_models:
+            if 'gemini-1.5-flash' in m:
+                return m
+        
+        # إذا لم يجد، نستخدم الاسم المختصر كبديل
+        return "gemini-1.5-flash"
+    except Exception as e:
+        print(f"⚠️ فشل اكتشاف النماذج: {e}")
+        return "gemini-1.5-flash"
 
 MODEL_NAME = get_model_name()
+print(f"✅ تم اختيار النموذج: {MODEL_NAME}")
 
-# --- 2. تحميل المكتبة الكاملة مع الحماية ---
+# --- 2. تحميل المكتبة الكاملة ---
 all_knowledge = []
 KB_PATH = "library_knowledge"
 
@@ -44,7 +55,7 @@ def load_library():
 
 load_library()
 
-# --- 3. محرك البحث الذكي (محمي من الحقول المفقودة) ---
+# --- 3. محرك البحث الذكي ---
 def normalize(text):
     if not text: return ""
     text = str(text)
@@ -60,13 +71,10 @@ def advanced_search(query, units, top_k=3):
     
     scored_indices = []
     for idx, unit in enumerate(units):
-        # استخدام .get لضمان عدم الانهيار إذا فقد الحقل
         content = unit.get("content", "")
         if not content: continue
-        
         content_norm = normalize(content)
         score = sum(5 for kw in keywords if kw in content_norm)
-        
         if re.match(r'^(\d+[-)]|[أ-ي][-)])', str(content).strip()): score += 2
         if score > 0:
             scored_indices.append((score, idx))
@@ -89,41 +97,36 @@ def advanced_search(query, units, top_k=3):
 def ask():
     try:
         data = request.json
-        if not data: return jsonify({"answer": "خطأ في استقبال البيانات."}), 400
+        if not data: return jsonify({"answer": "خطأ في البيانات"}), 400
         
         user_query = data.get("question")
-        if not user_query: return jsonify({"answer": "لم يصل سؤال."}), 400
-
-        if not all_knowledge:
-            return jsonify({"answer": "المكتبة فارغة، تأكد من رفع ملفات الـ JSON في المجلد الصحيح."})
+        if not user_query: return jsonify({"answer": "لم يصل سؤال"}), 400
 
         results = advanced_search(user_query, all_knowledge)
-        if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة المرفوعة."})
+        if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة."})
 
-        # بناء السياق مع حماية كاملة لكل الحقول
         ctx_text = ""
         for i, u in enumerate(results):
-            author = u.get('author', 'غير متوفر')
-            book = u.get('book', 'غير متوفر')
+            author = u.get('author', '--')
+            book = u.get('book', '--')
             part = u.get('part', '1')
             page = u.get('page_pdf', '--')
-            content = u.get('content', '[نص مفقود]')
-            
-            ctx_text += f"\n--- [معرف المرجع: {i+1}] ---\nالمؤلف: {author} | الكتاب: {book} | ج: {part} | ص: {page}\nالنص: {content}\n"
+            content = u.get('content', '')
+            ctx_text += f"\n--- [مرجع: {i+1}] ---\nالمؤلف: {author} | الكتاب: {book} | ج: {part} | ص: {page}\nالنص: {content}\n"
         
+        # الموجه (Prompt) المدمج: يجمع بين الربط اللغوي والنسخ الحرفي الكامل
         prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية، إليكم عرضاً موثقاً استجابةً لسؤالكم:
 
-        التعليمات:
-        1. ابدأ بـ: "بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:"
-        2. استخدم الربط اللغوي ولكن انقل النصوص المرجعية 'حرفياً' وبالكامل.
-        3. ضع كل اقتباس حرفي بين "" متبوعاً برقم مرجع [1]، [2]... دون تكرار الرقم.
-        4. في النهاية اكتب (المراجع:) وسردها بالصيغة: رقم المرجع- المؤلف، الكتاب، الجزء، ص: الصفحة.
+        مهمتك صياغة إجابة 'كاملة' و 'مترابطة' وفق الشروط الصارمة التالية:
+        1. العبارة الاستهلالية: ابدأ حصراً بـ: "بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:"
+        2. الربط والنسخ: استخدم أدوات الربط اللغوية (مثل: وفي هذا السياق، علاوة على ذلك، كما يقرر في موضع آخر...) لربط الأفكار، ولكن عندما تنقل المعلومة من النص المرفق، انقلها 'حرفياً' وبالكامل دون أي اختصار أو تلخيص.
+        3. التوثيق المتسلسل (المتن): ضع كل نص منقول حرفياً بين علامتي تنصيص "" متبوعاً برقم مرجع متسلسل [1]، ثم [2]، وهكذا. 
+           - هام: لا تكرر الرقم أبداً. كل اقتباس جديد يأخذ رقماً جديداً (1، 2، 3...) حتى لو كان من نفس الصفحة.
+        4. عدم الضياع: انقل القوائم والتعليلات كما وردت في النصوص المرفقة كاملةً.
+        5. الحاشية (المراجع): في نهاية الإجابة، اكتب عنواناً بارزاً (المراجع:) ثم اذكر المراجع المقابلة للأرقام بالصيغة: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: رقم الصفحة.
+        6. الصرامة: ممنوع إضافة أي معلومة من خارج النصوص المرفقة أو تأويل شخصي.
 
-        المادة العلمية:
-        {ctx_text}
-
-        سؤال الباحث:
-        {user_query}
+        سؤال الباحث: {user_query}
         """
 
         model = genai.GenerativeModel(model_name=MODEL_NAME)
@@ -134,12 +137,19 @@ def ask():
                 return jsonify({"answer": response.text})
             except exceptions.TooManyRequests:
                 time.sleep(10)
+            except Exception as e:
+                # محاولة أخيرة باسم نموذج مختلف إذا فشل الأول
+                if "not found" in str(e).lower():
+                    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+                    response = model.generate_content(prompt)
+                    return jsonify({"answer": response.text})
+                raise e
         
-        return jsonify({"answer": "⚠️ الخادم مزدحم، يرجى إعادة المحاولة."})
+        return jsonify({"answer": "⚠️ الخادم مزدحم، حاول مجدداً."})
 
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        return jsonify({"answer": f"❌ حدث خطأ داخلي: {str(e)}"}), 500
+        print(f"❌ Error during request: {e}")
+        return jsonify({"answer": f"❌ حدث خطأ: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
