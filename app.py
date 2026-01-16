@@ -9,14 +9,38 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini (نسخة مستقرة جداً) ---
+# --- 1. إعدادات جوجل Gemini وحل مشكلة الـ 404 ---
 api_key = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 
-# اختيار الاسم البرمجي المباشر والأكثر شهرة
-MODEL_NAME = "gemini-1.5-flash"
+# قائمة بالأسماء التقنية المحتملة للنموذج (سنجربها بالترتيب)
+CANDIDATE_MODELS = [
+    "models/gemini-1.5-flash",
+    "gemini-1.5-flash",
+    "models/gemini-pro",
+    "gemini-pro"
+]
 
-# --- 2. تحميل المكتبة مع معالجة الأخطاء ---
+def try_generate_content(prompt):
+    """دالة ذكية تجرب كل الأسماء المتاحة للنموذج حتى تنجح"""
+    for model_name in CANDIDATE_MODELS:
+        try:
+            print(f"🔄 محاولة استخدام النموذج: {model_name}")
+            model = genai.GenerativeModel(model_name=model_name)
+            response = model.generate_content(prompt)
+            if response:
+                return response.text
+        except Exception as e:
+            if "not found" in str(e).lower() or "404" in str(e).lower():
+                print(f"❌ الاسم {model_name} غير مدعوم، ننتقل للتالي...")
+                continue
+            else:
+                # إذا كان الخطأ ليس 404 (مثل ضغط الخادم)، انتظر ثوانٍ
+                print(f"⚠️ خطأ مؤقت: {e}")
+                time.sleep(2)
+    return None
+
+# --- 2. تحميل المكتبة ---
 all_knowledge = []
 def load_kb():
     global all_knowledge
@@ -25,13 +49,9 @@ def load_kb():
     if os.path.exists(path):
         for f_name in sorted(os.listdir(path)):
             if f_name.endswith(".json"):
-                try:
-                    with open(os.path.join(path, f_name), "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            all_knowledge.extend(data)
-                except Exception as e:
-                    print(f"⚠️ خطأ في ملف {f_name}: {e}")
+                with open(os.path.join(path, f_name), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list): all_knowledge.extend(data)
     print(f"📚 تم تحميل {len(all_knowledge)} وحدة.")
 
 load_kb()
@@ -43,13 +63,10 @@ def normalize(t): return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.su
 def ask():
     try:
         data = request.get_json()
-        if not data or "question" not in data:
-            return jsonify({"answer": "لم يصل سؤال صحيح."}), 400
+        q = data.get("question")
+        if not q: return jsonify({"answer": "لم يصل سؤال"}), 400
         
-        q = data["question"]
-        print(f"❓ سؤال مستلم: {q}")
-
-        # بحث سريع
+        # البحث في النصوص
         keywords = [w for w in normalize(q).split() if len(w) > 2]
         scored = []
         for i, u in enumerate(all_knowledge):
@@ -58,42 +75,36 @@ def ask():
             if score > 0: scored.append((score, i))
         
         scored.sort(reverse=True)
-        # نأخذ أفضل 7 نتائج لضمان جلب كامل للمعلومات دون استهلاك ذاكرة
-        top_results = [all_knowledge[i] for _, i in scored[:7]]
+        top_results = [all_knowledge[i] for _, i in scored[:8]]
 
         if not top_results:
-            return jsonify({"answer": "عذراً، لم أجد معلومات متعلقة بسؤالك في المكتبة المرفوعة."})
+            return jsonify({"answer": "عذراً، لم أجد معلومات متعلقة بسؤالك."})
 
-        # بناء السياق للذكاء الاصطناعي
+        # بناء السياق
         ctx = ""
         for i, r in enumerate(top_results):
             ctx += f"\n[مرجع:{i+1}] {r.get('author','--')} | {r.get('book','--')} | ج:{r.get('part','1')} | ص:{r.get('page_pdf','--')}\nالنص: {r.get('content','')}\n"
 
-        # التعليمات الصارمة (الدمج الأكاديمي والربط والنسخ)
+        # صياغة التعليمات (البرومبت)
         prompt = f"""أنت باحث أكاديمي متخصص في فكر الدكتور عبد الرحمن الحاج صالح. 
-        ابدأ الإجابة بـ: "بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:"
+        ابدأ الإجابة بعبارة الترحيب الأكاديمية الصارمة.
+        - انسخ النصوص المرفقة حرفياً وبالكامل بين "" مع رقم المرجع [1].
+        - اربط الأفكار بذكاء وتجنب تكرار أرقام المراجع.
+        - الحاشية (المراجع) في الأسفل كاملة البيانات.
         
-        التعليمات:
-        1. انسخ النصوص المرفقة "حرفياً" وبالكامل كما وردت دون تغيير أو تلخيص.
-        2. اربط بين النصوص بذكاء لغوي (وفي هذا السياق، كما يشير البروفيسور...).
-        3. ضع النصوص المنقولة حرفياً بين "" متبوعة برقم المرجع المتسلسل [1]، [2] إلخ (لا تكرر الأرقام).
-        4. المراجع في النهاية بدقة (المؤلف، الكتاب، الجزء، ص).
-        
-        المتــــون: {ctx}
+        النصوص المستخرجة: {ctx}
         سؤال الباحث: {q}"""
 
-        # محاولة توليد الإجابة
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(prompt)
+        # طلب الإجابة من الدالة الذكية (Fallback Logic)
+        final_answer = try_generate_content(prompt)
         
-        if response and response.text:
-            return jsonify({"answer": response.text})
+        if final_answer:
+            return jsonify({"answer": final_answer})
         else:
-            return jsonify({"answer": "⚠️ اعتذر، لم يستطع المحرك صياغة إجابة الآن."})
+            return jsonify({"answer": "❌ عذراً، فشل الاتصال بمحركات الذكاء الاصطناعي. يرجى مراجعة مفتاح API."}), 500
 
     except Exception as e:
-        print(f"❌ خطأ فادح: {str(e)}") # سيظهر هذا في سجلات Render لمعرفة السبب
-        return jsonify({"answer": f"❌ حدث خطأ فني: {str(e)}"}), 500
+        return jsonify({"answer": f"❌ خطأ داخلي: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
