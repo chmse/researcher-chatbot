@@ -10,29 +10,36 @@ from google.api_core import exceptions
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini مع إصلاح خطأ الـ 404 ---
+# --- 1. إعدادات جوجل Gemini وحل مشكلة الـ 404 ---
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
-def get_model_name():
-    """دالة ذكية لاكتشاف اسم النموذج الصحيح وتجنب خطأ 404"""
-    try:
-        # محاولة سرد النماذج المتاحة لمفتاحك
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # البحث عن نموذج flash 1.5
-        for m in available_models:
-            if 'gemini-1.5-flash' in m:
-                return m
-        
-        # إذا لم يجد، نستخدم الاسم المختصر كبديل
-        return "gemini-1.5-flash"
-    except Exception as e:
-        print(f"⚠️ فشل اكتشاف النماذج: {e}")
-        return "gemini-1.5-flash"
+# قائمة بالأسماء التقنية المحتملة للنموذج حسب تحديثات جوجل
+MODELS_TO_TRY = [
+    "gemini-1.5-flash",
+    "models/gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-pro"
+]
 
-MODEL_NAME = get_model_name()
-print(f"✅ تم اختيار النموذج: {MODEL_NAME}")
+def generate_with_fallback(prompt):
+    """دالة تحاول الاتصال بالذكاء الاصطناعي وتجربة نماذج مختلفة إذا فشل أحدها"""
+    for model_name in MODELS_TO_TRY:
+        try:
+            print(f"🔄 محاولة استخدام النموذج: {model_name}")
+            model = genai.GenerativeModel(model_name=model_name)
+            response = model.generate_content(prompt, generation_config={"temperature": 0.0})
+            return response.text
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "not found" in error_msg or "404" in error_msg:
+                print(f"❌ النموذج {model_name} غير متاح، تجربة التالي...")
+                continue
+            else:
+                # إذا كان الخطأ ليس 404 (مثل ازدحام الخادم)، ننتظر قليلاً
+                print(f"⚠️ خطأ غير متوقع: {e}")
+                time.sleep(2)
+    return None
 
 # --- 2. تحميل المكتبة الكاملة ---
 all_knowledge = []
@@ -51,11 +58,12 @@ def load_library():
                             all_knowledge.extend(data)
                 except Exception as e:
                     print(f"⚠️ خطأ في تحميل ملف {filename}: {e}")
+    print(f"📚 تم تحميل {len(all_knowledge)} وحدة معرفية.")
     return len(all_knowledge)
 
 load_library()
 
-# --- 3. محرك البحث الذكي ---
+# --- 3. محرك البحث الذكي (محسن لعدم الانهيار) ---
 def normalize(text):
     if not text: return ""
     text = str(text)
@@ -83,6 +91,7 @@ def advanced_search(query, units, top_k=3):
     
     final_indices = set()
     for _, idx in scored_indices[:top_k]:
+        # جلب سياق موسع (15 فقرة) لضمان النسخ واللصق الكامل
         for i in range(max(0, idx-2), min(len(units), idx+15)):
             u_content = units[i].get("content", "")
             if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', str(u_content).strip()) or any(k in normalize(u_content) for k in keywords):
@@ -92,19 +101,19 @@ def advanced_search(query, units, top_k=3):
                 
     return [units[i] for i in sorted(list(final_indices))]
 
-# --- 4. نقطة الاتصال ---
+# --- 4. نقطة الاتصال الرئيسية ---
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
         data = request.json
-        if not data: return jsonify({"answer": "خطأ في البيانات"}), 400
-        
         user_query = data.get("question")
-        if not user_query: return jsonify({"answer": "لم يصل سؤال"}), 400
+        if not user_query: return jsonify({"answer": "لم يصل سؤال."}), 400
 
+        # جلب المعلومات من المكتبة
         results = advanced_search(user_query, all_knowledge)
         if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة."})
 
+        # بناء سياق النصوص المرجعية
         ctx_text = ""
         for i, u in enumerate(results):
             author = u.get('author', '--')
@@ -112,7 +121,7 @@ def ask():
             part = u.get('part', '1')
             page = u.get('page_pdf', '--')
             content = u.get('content', '')
-            ctx_text += f"\n--- [مرجع: {i+1}] ---\nالمؤلف: {author} | الكتاب: {book} | ج: {part} | ص: {page}\nالنص: {content}\n"
+            ctx_text += f"\n[مرجع رقم: {i+1}] [مؤلف: {author}] [كتاب: {book}] [ج: {part}] [ص: {page}]\n{content}\n"
         
         # الموجه (Prompt) المدمج: يجمع بين الربط اللغوي والنسخ الحرفي الكامل
         prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية، إليكم عرضاً موثقاً استجابةً لسؤالكم:
@@ -126,30 +135,24 @@ def ask():
         5. الحاشية (المراجع): في نهاية الإجابة، اكتب عنواناً بارزاً (المراجع:) ثم اذكر المراجع المقابلة للأرقام بالصيغة: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: رقم الصفحة.
         6. الصرامة: ممنوع إضافة أي معلومة من خارج النصوص المرفقة أو تأويل شخصي.
 
-        سؤال الباحث: {user_query}
+
+        المادة المرجعية:
+        {ctx_text}
+        
+        السؤال: {user_query}
         """
 
-        model = genai.GenerativeModel(model_name=MODEL_NAME)
+        # استخدام دالة المحاولات المتكررة (Fallback)
+        answer = generate_with_fallback(prompt)
         
-        for _ in range(3): 
-            try:
-                response = model.generate_content(prompt, generation_config={"temperature": 0.0})
-                return jsonify({"answer": response.text})
-            except exceptions.TooManyRequests:
-                time.sleep(10)
-            except Exception as e:
-                # محاولة أخيرة باسم نموذج مختلف إذا فشل الأول
-                if "not found" in str(e).lower():
-                    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-                    response = model.generate_content(prompt)
-                    return jsonify({"answer": response.text})
-                raise e
-        
-        return jsonify({"answer": "⚠️ الخادم مزدحم، حاول مجدداً."})
+        if answer:
+            return jsonify({"answer": answer})
+        else:
+            return jsonify({"answer": "❌ عذراً، لم ينجح الاتصال بنماذج الذكاء الاصطناعي حالياً. تأكد من صحة مفتاح API."}), 500
 
     except Exception as e:
-        print(f"❌ Error during request: {e}")
-        return jsonify({"answer": f"❌ حدث خطأ: {str(e)}"}), 500
+        print(f"❌ Error: {e}")
+        return jsonify({"answer": f"❌ حدث خطأ داخلي: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
