@@ -5,121 +5,123 @@ import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
-from google.api_core import exceptions
 
 app = Flask(__name__)
 CORS(app) 
 
-# --- 1. إعدادات جوجل Gemini واكتشاف النموذج (هذا الجزء هو سر نجاح الاتصال) ---
-GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
+# --- 1. إعدادات جوجل Gemini (النسخة الذكية لتجنب خطأ 404) ---
+api_key = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
 
-def get_model_name():
-    try:
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for m in models:
-            if '1.5-flash' in m: return m
-        return models[0] if models else "models/gemini-1.5-flash"
-    except:
-        return "models/gemini-1.5-flash"
+CANDIDATE_MODELS = [
+    "models/gemini-1.5-flash",
+    "gemini-1.5-flash",
+    "models/gemini-pro",
+    "gemini-pro"
+]
 
-MODEL_NAME = get_model_name()
+def generate_with_fallback(prompt):
+    """تجربة النماذج المتاحة حتى ينجح أحدهما"""
+    for model_name in CANDIDATE_MODELS:
+        try:
+            model = genai.GenerativeModel(model_name=model_name)
+            response = model.generate_content(prompt, generation_config={"temperature": 0.0})
+            if response: return response.text
+        except Exception as e:
+            if "not found" in str(e).lower() or "404" in str(e).lower():
+                continue
+            else:
+                time.sleep(2)
+    return None
 
-# --- 2. تحميل المكتبة الكاملة من المجلد ---
+# --- 2. تحميل المكتبة الكاملة ---
 all_knowledge = []
-KB_PATH = "library_knowledge"
-
-def load_library():
+def load_kb():
     global all_knowledge
     all_knowledge = []
-    if os.path.exists(KB_PATH):
-        for filename in sorted(os.listdir(KB_PATH)):
-            if filename.endswith(".json"):
-                with open(os.path.join(KB_PATH, filename), "r", encoding="utf-8") as f:
-                    all_knowledge.extend(json.load(f))
-    return len(all_knowledge)
+    path = "library_knowledge"
+    if os.path.exists(path):
+        for f_name in sorted(os.listdir(path)):
+            if f_name.endswith(".json"):
+                with open(os.path.join(path, f_name), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list): all_knowledge.extend(data)
+    print(f"📚 تم تحميل {len(all_knowledge)} وحدة معرفية.")
 
-load_library()
+load_kb()
 
-# --- 3. محرك البحث الاستكشافي (هذا الجزء يضمن سحب القوائم والتعليلات كاملة) ---
-def normalize(text):
-    if not text: return ""
-    return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", text))).strip()
+def normalize(t): return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", str(t or "")))).strip()
 
+# --- 3. محرك البحث الاستكشافي (القوة المضافة) ---
 def advanced_search(query, units, top_k=3):
+    """يبحث عن الكلمات المفتاحية ويسحب القوائم والفقرات المرتبطة (15 فقرة بعد)"""
     query_norm = normalize(query)
     stop_words = {"ما","هي","أهم","مفهوم","في","على","من","إلى","عن","الذي","التي"}
     keywords = [w for w in query_norm.split() if w not in stop_words and len(w) > 2]
     
     scored_indices = []
     for idx, unit in enumerate(units):
-        content = unit.get("content", "")
-        score = sum(5 for kw in keywords if kw in normalize(content))
-        if re.match(r'^(\d+[-)]|[أ-ي][-)])', content.strip()): score += 2
-        if score > 0:
-            scored_indices.append((score, idx))
+        content = normalize(unit.get("content", ""))
+        score = sum(5 for kw in keywords if kw in content)
+        # إعطاء أفضلية للفقرات المرقبة (أرقام أو حروف)
+        if re.match(r'^(\d+[-)]|[أ-ي][-)])', str(unit.get("content", "")).strip()): score += 2
+        if score > 0: scored_indices.append((score, idx))
     
     scored_indices.sort(key=lambda x: x[0], reverse=True)
     
     final_indices = set()
-    # جلب سياق موسع (2 قبل و 15 بعد) لضمان جلب كامل الفقرة
     for _, idx in scored_indices[:top_k]:
+        # التوسع: سحب فقرتين قبل (للسياق) و15 فقرة بعد (لضمان جلب كامل القائمة)
         for i in range(max(0, idx-2), min(len(units), idx+15)):
             u_content = units[i].get("content", "")
-            if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()) or any(k in normalize(u_content) for k in keywords):
+            # ضم الفقرة إذا كانت مرتبطة بكلمات البحث أو بتسلسل ترقيمي
+            if i == idx or re.match(r'^(\d+[-)]|[أ-ي][-)])', str(u_content).strip()) or any(k in normalize(u_content) for k in keywords):
                 final_indices.add(i)
-            if i > idx + 7 and not re.match(r'^(\d+[-)]|[أ-ي][-)])', u_content.strip()):
-                break
+            # التوقف إذا ابتعدنا كثيراً وانقطع الترقيم
+            if i > idx + 8 and not re.match(r'^(\d+[-)]|[أ-ي][-)])', str(u_content).strip()): break
                 
     return [units[i] for i in sorted(list(final_indices))]
 
-# --- 4. نقطة الاتصال (تحديث الموجه ليكون صارماً وأكاديمياً) ---
+# --- 4. معالجة الطلب وصياغة الإجابة ---
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
-        data = request.json
-        user_query = data.get("question")
-        if not user_query: return jsonify({"answer": "لم يصل سؤال."}), 400
+        data = request.get_json()
+        q = data.get("question")
+        if not q: return jsonify({"answer": "لم يصل سؤال"}), 400
 
-        results = advanced_search(user_query, all_knowledge)
-        if not results: return jsonify({"answer": "عذراً، لم أجد هذه المعلومة في المكتبة المرفوعة."})
+        # استخدام البحث المطور
+        results = advanced_search(q, all_knowledge)
+        if not results: return jsonify({"answer": "لم أجد هذه المعلومة في المكتبة."})
 
-        # بناء نصوص السياق بدقة
-        ctx_text = ""
-        for i, u in enumerate(results):
-            ctx_text += f"\n--- [معرف السياق: {i+1}] ---\nالمؤلف: {u.get('author','--')} | الكتاب: {u.get('book','--')} | ج: {u.get('part','--')} | ص: {u.get('page_pdf','--')}\nالنص: {u['content']}\n"
-        
-        # الموجه (Prompt) الجديد: صرامة النسخ + دقة التوثيق المتسلسل
-        prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً رداً على سؤالكم:
+        # بناء مرجع النصوص
+        ctx = ""
+        for i, r in enumerate(results):
+            ctx += f"\n[م:{i+1}] {r.get('author','--')} | {r.get('book','--')} | ج:{r.get('part','1')} | ص:{r.get('page_pdf','--')}\nنص:{r.get('content','')}\n"
 
-        مهمتك صياغة إجابة 'كاملة' و 'مترابطة' وفق الشروط الصارمة التالية:
-        1. العبارة الاستهلالية: ابدأ حصراً بـ: "بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:"
-        2. النقل والنسخ: انقل النصوص المرجعية 'حرفياً وبالكامل' دون أي تلخيص أو حذف للجمل الطويلة. استخدم روابط لغوية ذكية للربط بين هذه النصوص (مثل: كما يشير في موضع آخر، علاوة على ذلك يقرر...).
-        3. التوثيق المتسلسل في المتن: ضع كل اقتباس حرفي بين علامتي تنصيص "" متبوعاً برقم مرجع متسلسل [1]، ثم [2] وهكذا.
-           - ملاحظة: يجب أن يكون الترقيم متسلسلاً (1، 2، 3...) حسب ظهوره في الإجابة، ولا تكرر نفس الرقم أبداً؛ كل اقتباس جديد يأخذ رقماً جديداً حتى لو كان من نفس الصفحة.
-        4. المراجع (الحاشية): في نهاية الإجابة، اكتب عنواناً بارزاً (المراجع:) ثم سرد المراجع المقابلة لكل رقم استخدمته بالصيغة: رقم المرجع- اسم المؤلف، اسم الكتاب، الجزء، ص: الصفحة.
-        5. الصرامة: لا تضف أي معلومة خارجية أو تأويل. انقل القوائم المرقمة كما وردت تماماً.
+        # موجه الأوامر (الصارم)
+        prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً استجابةً لسؤالكم:
 
-        النصوص المرجعية المستخرجة من المكتبة:
-        {ctx_text}
+        الشروط والأوامر:
+        1. ابدأ حصراً بعبارة الترحيب الأكاديمية: "بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً للأصول العلمية رداً على سؤالكم:"
+        2. انسخ النصوص المرفقة بالأسفل "حرفياً وبالكامل" كما هي دون تلخيص أو تغيير للألفاظ.
+        3. اربط بين الاقتباسات بذكاء لغوي (وفي هذا الصدد، كما يوضح في موضع آخر، علاوة على...).
+        4. ضع النص المنقول بين "" متبوعاً برقم متسلسل [1]، [2] وهكذا (لا تكرر الأرقام، كل اقتباس له رقم جديد).
+        5. في النهاية اذكر المراجع كاملة ببياناتها (المؤلف، الكتاب، ص، ج).
 
-        سؤال الباحث:
-        {user_query}
+        المادة المرجعية المرفقة:
+        {ctx}
+
+        سؤال الباحث: {q}
         """
 
-        model = genai.GenerativeModel(model_name=MODEL_NAME)
+        answer = generate_with_fallback(prompt)
         
-        for _ in range(3): 
-            try:
-                response = model.generate_content(prompt, generation_config={"temperature": 0.0})
-                return jsonify({"answer": response.text})
-            except exceptions.TooManyRequests:
-                time.sleep(15)
-        
-        return jsonify({"answer": "⚠️ الخادم مزدحم حالياً، يرجى المحاولة مرة أخرى."})
+        if answer: return jsonify({"answer": answer})
+        return jsonify({"answer": "⚠️ فشل المحرك في توليد الإجابة."}), 500
 
     except Exception as e:
-        return jsonify({"answer": f"❌ خطأ تقني: {str(e)}"}), 500
+        return jsonify({"answer": f"❌ خطأ فني: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    app.run(host='0.0.0.0', port=10000)
