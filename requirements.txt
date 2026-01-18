@@ -1,8 +1,8 @@
 flask
 flask-cors
 google-generativeai
+requests
 gunicorn
-
 
 
 
