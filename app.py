@@ -2,8 +2,8 @@ import os
 import json
 import re
 import time
-import requests
 import traceback
+import requests # مكتبة إضافية ضرورية للاتصال بمحركات خارجية مثل Groq
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -11,94 +11,139 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app) 
 
-# --- الإعدادات ---
-api_key = os.environ.get("GEMINI_API_KEY")
-groq_key = os.environ.get("GROQ_API_KEY")
+# --- 1. إعدادات المفاتيح (جلب المفاتيح من Render) ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# --- محركات الاستجابة مع إعدادات تقليل الضغط ---
-def call_gemini(prompt):
+# --- إعداد Gemini الأصلي ---
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+def get_best_model():
     try:
-        if not api_key: return None
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        # إرسال طلب سريع بدون حرارة عالية
-        res = model.generate_content(prompt, generation_config={"temperature": 0.1})
-        return res.text
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for m in models:
+            if '1.5-flash' in m: return m
+        return models[0] if models else "gemini-1.5-flash"
+    except: return "gemini-1.5-flash"
+
+MODEL_NAME = get_best_model()
+
+# ================================================================
+# الشرح: لكيفية إضافة API آخر (مثلاً OpenAI أو Claude):
+# 1. أنشئ دالة جديدة تشبه 'call_groq' بالأسفل.
+# 2. غير الرابط (URL) والموديل (Model Name) وحقول الـ JSON حسب متطلبات الموقع الجديد.
+# 3. في الدالة 'ask' بالأسفل، أضف 'or call_new_api(prompt)' في سطر الاستجابة.
+# ================================================================
+
+# وظيفة محرك Gemini (المحرك الأول)
+def call_gemini_engine(prompt, safety_settings):
+    try:
+        if not GEMINI_API_KEY: return None
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt, safety_settings=safety_settings, generation_config={"temperature": 0.0})
+        return response.text if response and response.text else None
     except: return None
 
-def call_groq(prompt):
+# وظيفة محرك Groq (المحرك الاحتياطي)
+def call_groq_engine(prompt):
     try:
-        if not groq_key: return None
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
-        payload = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
-        res = requests.post(url, headers=headers, json=payload, timeout=50)
-        return res.json()['choices'][0]['message']['content'] if res.status_code == 200 else None
+        if not GROQ_API_KEY: return None
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "llama-3.3-70b-versatile", # يمكنك تغيير الموديل هنا
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0
+        }
+        res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        if res.status_code == 200:
+            return res.json()['choices'][0]['message']['content']
     except: return None
 
-# --- تحميل المكتبة والبحث الاستكشافي المتوازن ---
+# --- 2. تحميل المكتبة الكاملة (مع معالجة الأخطاء) ---
 all_knowledge = []
 def load_kb():
     global all_knowledge
+    all_knowledge = []
     path = "library_knowledge"
     if os.path.exists(path):
-        for f in sorted(os.listdir(path)):
-            if f.endswith(".json"):
-                with open(os.path.join(path, f), "r", encoding="utf-8") as file:
-                    all_knowledge.extend(json.load(file))
+        for f_name in sorted(os.listdir(path)):
+            if f_name.endswith(".json"):
+                try:
+                    with open(os.path.join(path, f_name), "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list): all_knowledge.extend(data)
+                except Exception as e: print(f"⚠️ خطأ في {f_name}: {e}")
+    print(f"📚 تم تحميل {len(all_knowledge)} وحدة معرفية.")
+
 load_kb()
 
-def normalize(t): return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", str(t or "")))).strip()
+def normalize(t): 
+    return re.sub("[إأآا]", "ا", re.sub("[ةه]", "ه", re.sub("ى", "ي", str(t or "")))).strip()
 
-def search_optimized(query, units, top_k=2): # خفضنا k لتقليل الحِمل
-    q_norm = normalize(query)
-    keywords = [w for w in q_norm.split() if len(w) > 2]
+# --- 3. محرك البحث الاستكشافي المطور ---
+def advanced_search(query, units, top_k=3):
+    query_norm = normalize(query)
+    keywords = [w for w in query_norm.split() if w not in {"ما","هي","أهم","مفهوم","في"} and len(w) > 2]
+    
     scored = []
     for idx, unit in enumerate(units):
         content = normalize(unit.get("content", ""))
-        score = sum(15 for k in keywords if k in content)
+        score = sum(10 for kw in keywords if kw in content)
+        if re.match(r'^(\d+[-)]|[أ-ي][-)])', str(unit.get("content", "")).strip()):
+            score += 5
         if score > 0: scored.append((score, idx))
-    scored.sort(reverse=True)
     
-    indices = set()
+    scored.sort(key=lambda x: x[0], reverse=True)
+    final_indices = set()
     for _, idx in scored[:top_k]:
-        # سحب متوازن (15 فقرة تالية) يضمن المعلومة ويحمي الذاكرة
-        for i in range(max(0, idx-2), min(len(units), idx+15)): 
-            indices.add(i)
-    return [units[i] for i in sorted(list(indices))]
+        for i in range(max(0, idx-2), min(len(units), idx+15)):
+            final_indices.add(i)
+    return [units[i] for i in sorted(list(final_indices))]
 
-# --- نقطة الاتصال مع صمام أمان للنصوص ---
+# --- 4. نقطة الاتصال والتبديل التلقائي بين API ---
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
         data = request.get_json()
-        query = data.get("question")
-        results = search_optimized(query, all_knowledge)
-        
-        if not results: return jsonify({"answer": "عذراً، لم أجد المادة في المكتبة."})
+        if not data: return jsonify({"answer": "بيانات مفقودة"}), 400
+        user_query = data.get("question")
+        results = advanced_search(user_query, all_knowledge)
+        if not results: return jsonify({"answer": "عذراً، لم أجد ذلك في المكتبة."})
 
-        # بناء السياق مع حد أقصى للكلمات (Safety Buffer)
         ctx = ""
         for i, r in enumerate(results):
-            ctx += f"\n[المرجع_{i+1}]: {r.get('book','--')} ص:{r.get('page_pdf','--')}\n{r.get('content','')}\n"
-            if len(ctx) > 10000: break # إذا تجاوز النص 10 آلاف حرف يتوقف السحب فوراً لمنع الانهيار
+            ctx += f"\n[م:{i+1}] {r.get('author','--')} | {r.get('book','--')} | ج:{r.get('part','1')} | ص:{r.get('page_pdf','--')}\nالنص:{r.get('content','')}\n"
 
-        prompt = f"""بصفتي باحثاً أكاديمياً، إليكم العرض الموثق رداً على: {query}
-        المادة: {ctx}
-        القواعد:
-        1. ابدأ بعبارة الترحيب الأكاديمية (بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح...).
-        2. انقل النصوص حرفياً وبالكامل بين "" مع الرقم [1]. 
-        3. اربط بينها بأدوات ربط لغوية فقط (مثل: كما يشير في موضع آخر...).
-        4. المراجع كاملة في الأسفل (بدون مراجع زائدة).
-        """
+        prompt = f"""بصفتي باحثاً أكاديمياً في فكر الأستاذ الدكتور عبد الرحمن الحاج صالح، واستناداً إلى المنهجية اللسانية الاستقرائية في تحليل المتون المرفقة، إليكم عرضاً موثقاً رداً على سؤالكم:
 
-        ans = call_gemini(prompt) or call_groq(prompt)
+        التعليمات الصارمة:
+        1. ابدأ حصراً بعبارة الترحيب الأكاديمية المطلوبة.
+        2. استخدم الربط اللغوي لتجعل الإجابة كتلة واحدة منسجمة.
+        3. انسخ النصوص "حرفياً وبالكامل" بين علامتي تنصيص "" متبوعة بالمرجع [1] إلخ.
+        4. ممنوع تكرار رقم المرجع.
+        5. الحاشية في النهاية: (المراجع:) بدقة البيانات.
+        6. الأمانة العلمية: ممنوع الحذف أو التلخيص.
+
+        المواد المرجعية: {ctx}
+        سؤال الباحث: {user_query}"""
+
+        safety = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+
+        # 🔄 تعدد محركات الـ API: نحاول مع Gemini، وإذا فشل ننتقل فوراً لـ Groq
+        answer = call_gemini_engine(prompt, safety)
         
-        if ans: return jsonify({"answer": ans})
-        return jsonify({"answer": "⚠️ النظام متعب حالياً، حاول مرة أخرى."}), 500
+        if not answer:
+            print("🔄 Gemini مزدحم أو فشل.. التبديل إلى Groq")
+            answer = call_groq_engine(prompt)
+        
+        if answer:
+            return jsonify({"answer": answer})
+        return jsonify({"answer": "⚠️ نعتذر، جميع المحركات مشغولة حالياً."}), 500
 
-    except:
-        return jsonify({"answer": "❌ عذراً، تجاوز الطلب قدرة الذاكرة. حاول تضييق سؤالك."}), 500
+    except Exception as e:
+        print(f"❌ خطأ:\n{traceback.format_exc()}")
+        return jsonify({"answer": f"❌ خطأ فني: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
